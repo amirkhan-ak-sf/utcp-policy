@@ -1,0 +1,71 @@
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: ApiInstance
+metadata:
+  name: ingress-http
+spec:
+  address: http://0.0.0.0:8081
+  services:
+    upstream:
+      address: http://backend
+      routes:
+        - config:
+            destinationPath: /anything
+  policies:
+    - policyRef:
+        name: utcp-manual-validator-v0-1-impl  # overridden by `make run`
+        namespace: default
+      config:
+        manualSource: static
+        discoveryPath: /utcp
+        utcpVersion: "1.0.1"
+        enforcementMode: strict
+        validateInputs: true
+        staticManual: |-
+          {
+            "manual_version": "1.0.0",
+            "utcp_version": "1.0.1",
+            "info": { "title": "Demo Tools", "version": "1.0.0" },
+            "tools": [
+              {
+                "name": "getThing",
+                "description": "Fetch a thing by id",
+                "inputs": {
+                  "type": "object",
+                  "required": ["id"],
+                  "properties": { "id": { "type": "string", "minLength": 1 } }
+                },
+                "tool_call_template": {
+                  "call_template_type": "http",
+                  "url": "https://api.example.com/things/{id}",
+                  "http_method": "GET",
+                  "content_type": "application/json"
+                }
+              },
+              {
+                "name": "createThing",
+                "description": "Create a thing",
+                "inputs": {
+                  "type": "object",
+                  "required": ["body"],
+                  "properties": {
+                    "body": {
+                      "type": "object",
+                      "required": ["name"],
+                      "properties": {
+                        "name": { "type": "string", "minLength": 1 },
+                        "color": { "type": "string", "enum": ["red","green","blue"] }
+                      }
+                    }
+                  }
+                },
+                "tool_call_template": {
+                  "call_template_type": "http",
+                  "url": "https://api.example.com/things",
+                  "http_method": "POST",
+                  "content_type": "application/json",
+                  "body_field": "body"
+                }
+              }
+            ]
+          }

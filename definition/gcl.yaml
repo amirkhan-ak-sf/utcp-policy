@@ -1,0 +1,158 @@
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: Extension
+metadata:
+  labels:
+    title: UTCP Manual Validator
+    description: |
+      Universal Tool Calling Protocol (UTCP) gateway-side validator.
+
+      Hosts a UTCP "Manual" at a discovery path (default `/utcp`),
+      auto-generating it from the API instance's existing OpenAPI
+      specification. Validates inbound agent traffic against the Manual:
+      every tool call must correspond to a declared tool, and request
+      inputs (path / query / header / body) must satisfy the tool's
+      JSON Schema. Tags every successfully matched request with an
+      `x-utcp-tool` header so downstream rate-limit and audit policies
+      can scope by tool name.
+
+      The policy never holds upstream credentials; auth in the served
+      Manual is rendered as `${ENV_VAR}` placeholders that the agent
+      resolves on its side. Authentication of the agent itself is
+      delegated to other Omni Gateway policies (JWT, OAuth2, mTLS).
+    category: Security
+    metadata/interfaceScope: api,resource
+    metadata/capabilities/injectionPoint: inbound
+spec:
+  extends:
+    - name: extension-definition
+      namespace: default
+  properties:
+    discoveryPath:
+      type: string
+      default: "/utcp"
+      description: |
+        Path the policy serves the UTCP Manual on. Convention is `/utcp`.
+        `GET <discoveryPath>` short-circuits and returns the Manual JSON;
+        the request never reaches the upstream.
+    utcpVersion:
+      type: string
+      default: "1.0.1"
+      description: |
+        Value emitted as `utcp_version` in the served Manual. Should
+        reflect the UTCP spec version this policy actually targets.
+    manualSource:
+      type: string
+      enum:
+        - openapi
+        - static
+        - hybrid
+      default: openapi
+      description: |
+        Where the Manual comes from.
+
+        `openapi` (default): fetch the OpenAPI document at `openapiUrl`
+          and convert it on the fly.
+        `static`: serve the JSON in `staticManual` verbatim.
+        `hybrid`: start from the OpenAPI conversion and apply the
+          `overrides` patches on top (useful for adding `tags`,
+          `description`, custom `auth`, etc. without touching the
+          upstream OpenAPI).
+    openapiUrl:
+      type: string
+      default: ""
+      description: |
+        URL of the OpenAPI 3.x JSON or YAML document. Required when
+        `manualSource` is `openapi` or `hybrid`. HTTPS is required unless
+        `allowInsecureOpenapiUrl=true`. The OpenAPI document is fetched
+        on policy load and on every `refreshIntervalSeconds` tick.
+    allowInsecureOpenapiUrl:
+      type: boolean
+      default: false
+      description: |
+        Allow `http://` URLs for the OpenAPI source. Only intended for
+        local-mode development against a non-TLS spec server. Production
+        configurations should leave this at `false`.
+    refreshIntervalSeconds:
+      type: integer
+      minimum: 30
+      maximum: 86400
+      default: 300
+      description: |
+        How often the policy re-fetches the OpenAPI source and rebuilds
+        the cached Manual. Refresh failures keep the previous Manual
+        active and increment a refresh-failure counter.
+    staticManual:
+      type: string
+      default: ""
+      description: |
+        Verbatim UTCP Manual JSON. Used when `manualSource=static`. May
+        also be supplied alongside `manualSource=hybrid` to seed the
+        Manual before applying `overrides`. Must parse as a JSON object
+        with at least `utcp_version` and `tools`.
+    enforcementMode:
+      type: string
+      enum:
+        - strict
+        - permissive
+      default: strict
+      description: |
+        `strict`: requests whose `(method, path)` does not correspond to
+          any declared tool are rejected with HTTP 404
+          `utcp.tool_not_declared`.
+        `permissive`: unmatched requests pass through unmodified, but
+          the audit log records `utcp.unmatched=true` so operators can
+          observe drift between agent traffic and the Manual.
+    validateInputs:
+      type: boolean
+      default: true
+      description: |
+        Validate the request body / query / path / header against the
+        matched tool's `inputs` JSON Schema. When false, the policy only
+        does routing and tagging — useful when the schemas are noisy and
+        the operator wants observability without enforcement.
+    maxBodyBytes:
+      type: integer
+      minimum: 1024
+      maximum: 52428800
+      default: 1048576
+      description: |
+        Cap on the request body size when body validation is enabled.
+        Bodies larger than this are rejected with HTTP 413
+        `utcp.body_too_large`. Default 1 MiB; max 50 MiB.
+    requirePrincipal:
+      type: boolean
+      default: false
+      description: |
+        When true, requests with no principal header are rejected with
+        HTTP 401 `utcp.unauthenticated`. Use with an upstream auth
+        policy (JWT, API Key) that populates `principalHeader`.
+    principalHeader:
+      type: string
+      default: "x-anypoint-client-id"
+      description: |
+        Inbound header that carries the authenticated principal. Used in
+        audit logs and for the `requirePrincipal` enforcement check.
+    cacheControlHeader:
+      type: string
+      default: "public, max-age=60"
+      description: |
+        `Cache-Control` header value applied to the served Manual. Set
+        to a stricter value like `no-store` when the Manual changes
+        often.
+    toolHeaderName:
+      type: string
+      default: "x-utcp-tool"
+      description: |
+        Name of the request header set on the upstream request after a
+        successful tool match. Downstream policies (rate limit, audit)
+        can read this to scope per-tool.
+    toolNamePrefix:
+      type: string
+      default: ""
+      description: |
+        Optional prefix prepended to every auto-generated tool name in
+        the Manual. Lets multiple API instances share an agent without
+        tool-name collisions (`paymentsApi.getUser` vs `crmApi.getUser`).
+  required:
+    - manualSource

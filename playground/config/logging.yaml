@@ -1,0 +1,16 @@
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: Configuration
+metadata:
+  name: logging-config
+spec:
+  logging:
+    accessLog:
+      defaultFormat:
+        - json:
+            method: "%REQ(:METHOD)%"
+            path: "%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%"
+            status: "%RESPONSE_CODE%"
+            tool: "%REQ(X-UTCP-TOOL)%"
+            principal: "%REQ(X-ANYPOINT-CLIENT-ID)%"
+            duration_ms: "%DURATION%"

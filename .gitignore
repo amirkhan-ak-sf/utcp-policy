@@ -1,0 +1,17 @@
+.DS_Store
+
+# Rust / WASM build outputs
+/target/
+/Cargo.lock
+
+# Local policy config (may contain secrets)
+/policy-config.json
+
+# Generated policy assets
+/definition/target/
+/playground/config/custom-policies/*.yaml
+/playground/config/custom-policies/*.wasm
+
+# Local Flex Gateway registration credential
+/playground/config/registration.yaml
+.pdk
