@@ -3,23 +3,32 @@ apiVersion: gateway.mulesoft.com/v1alpha1
 kind: Extension
 metadata:
   labels:
-    title: UTCP Manual Validator
+    title: UTCP Bridge
     description: |
-      Universal Tool Calling Protocol (UTCP) gateway-side validator.
+      Universal Tool Calling Protocol (UTCP) gateway-side validator and
+      router.
 
-      Hosts a UTCP "Manual" at a discovery path (default `/utcp`),
-      auto-generating it from the API instance's existing OpenAPI
-      specification. Validates inbound agent traffic against the Manual:
-      every tool call must correspond to a declared tool, and request
-      inputs (path / query / header / body) must satisfy the tool's
-      JSON Schema. Tags every successfully matched request with an
+      Hosts a UTCP "Manual" at a discovery path (default `/utcp`) and
+      routes inbound agent traffic to one or more upstream services. The
+      Manual is built from the configured `upstreams[]` — each upstream
+      is a host (registered as a PDK Service so the gateway resolves DNS
+      and TLS) and a list of tools. Each tool maps to one HTTP route
+      (method + path) on the upstream and contributes one entry to the
+      Manual's `tools[]` array. Inbound caller headers and request body
+      are forwarded onward unchanged so upstream authorization /
+      tracing flows through transparently.
+
+      Validates inbound calls: the request must correspond to a declared
+      tool and (when `validateInputs=true`) satisfy the tool's JSON
+      Schema. Tags every successfully matched request with an
       `x-utcp-tool` header so downstream rate-limit and audit policies
       can scope by tool name.
 
-      The policy never holds upstream credentials; auth in the served
-      Manual is rendered as `${ENV_VAR}` placeholders that the agent
-      resolves on its side. Authentication of the agent itself is
-      delegated to other Omni Gateway policies (JWT, OAuth2, mTLS).
+      The policy never holds upstream credentials. Authentication of the
+      agent itself is delegated to other Omni Gateway policies (JWT,
+      OAuth2, mTLS) configured upstream of this one in the policy chain;
+      authorization to call the upstream is whatever the agent passes
+      through (Authorization, x-api-key, ...).
     category: Security
     metadata/interfaceScope: api,resource
     metadata/capabilities/injectionPoint: inbound
@@ -34,62 +43,125 @@ spec:
       description: |
         Path the policy serves the UTCP Manual on. Convention is `/utcp`.
         `GET <discoveryPath>` short-circuits and returns the Manual JSON;
-        the request never reaches the upstream.
+        the request never reaches any upstream.
+    apiInstanceProxyPath:
+      type: string
+      default: ""
+      description: |
+        Optional path prefix that the API instance proxies under (the
+        "Implementation URI" path component in API Manager). When set,
+        the policy strips this prefix from the inbound request path
+        before matching against tool paths and before computing the
+        outbound URL. Example: API instance is at
+        `https://gw/sap-orders-utcp`, tool path is `/api/order`. Set
+        `apiInstanceProxyPath=/sap-orders-utcp` so the inbound path
+        `/sap-orders-utcp/api/order` matches the tool `/api/order`.
+        Leave empty if the API instance is mounted at root.
     utcpVersion:
       type: string
       default: "1.0.1"
       description: |
         Value emitted as `utcp_version` in the served Manual. Should
         reflect the UTCP spec version this policy actually targets.
-    manualSource:
-      type: string
-      enum:
-        - openapi
-        - static
-        - hybrid
-      default: openapi
-      description: |
-        Where the Manual comes from.
-
-        `openapi` (default): fetch the OpenAPI document at `openapiUrl`
-          and convert it on the fly.
-        `static`: serve the JSON in `staticManual` verbatim.
-        `hybrid`: start from the OpenAPI conversion and apply the
-          `overrides` patches on top (useful for adding `tags`,
-          `description`, custom `auth`, etc. without touching the
-          upstream OpenAPI).
-    openapiUrl:
+    manualTitle:
       type: string
       default: ""
       description: |
-        URL of the OpenAPI 3.x JSON or YAML document. Required when
-        `manualSource` is `openapi` or `hybrid`. HTTPS is required unless
-        `allowInsecureOpenapiUrl=true`. The OpenAPI document is fetched
-        on policy load and on every `refreshIntervalSeconds` tick.
-    allowInsecureOpenapiUrl:
-      type: boolean
-      default: false
-      description: |
-        Allow `http://` URLs for the OpenAPI source. Only intended for
-        local-mode development against a non-TLS spec server. Production
-        configurations should leave this at `false`.
-    refreshIntervalSeconds:
-      type: integer
-      minimum: 30
-      maximum: 86400
-      default: 300
-      description: |
-        How often the policy re-fetches the OpenAPI source and rebuilds
-        the cached Manual. Refresh failures keep the previous Manual
-        active and increment a refresh-failure counter.
-    staticManual:
+        `info.title` of the synthesised Manual. Optional. Empty string
+        omits the field from the served JSON.
+    manualInfoVersion:
       type: string
       default: ""
       description: |
-        Verbatim UTCP Manual JSON. Used when `manualSource=static`. May
-        also be supplied alongside `manualSource=hybrid` to seed the
-        Manual before applying `overrides`. Must parse as a JSON object
-        with at least `utcp_version` and `tools`.
+        `info.version` of the synthesised Manual. Optional.
+    manualDescription:
+      type: string
+      default: ""
+      description: |
+        `info.description` of the synthesised Manual. Optional.
+    upstreams:
+      type: array
+      default: []
+      description: |
+        Upstream hosts and the tools they serve. In API Manager this
+        renders as a list with an Add button: each entry is one
+        upstream + one or more tools below it. The policy issues
+        outbound HTTP to the upstream `host` directly using the PDK
+        HttpClient, so the Flex API instance's own upstream URL does
+        not matter for routing — point it at any reachable host (e.g.
+        `https://example.com`) and define the real targets here.
+      items:
+        type: object
+        required:
+          - host
+        properties:
+          host:
+            type: string
+            format: service
+            description: |
+              Upstream URL (scheme + host, optionally + base path).
+              Registered as a PDK Service at policy load so the gateway
+              resolves DNS and TLS. Example:
+              `https://sap-orders-sys-api.example.com`.
+          tools:
+            type: array
+            default: []
+            description: |
+              Tools served on this upstream. Each entry contributes one
+              tool to the Manual.
+            items:
+              type: object
+              required:
+                - name
+                - path
+              properties:
+                name:
+                  type: string
+                  description: |
+                    Tool name. Used to route inbound requests and
+                    emitted on the `<toolHeaderName>` header (default
+                    `x-utcp-tool`). Should be unique across the policy.
+                description:
+                  type: string
+                  default: ""
+                  description: |
+                    Free-form description. Surfaces to agents in the
+                    Manual.
+                method:
+                  type: string
+                  default: "POST"
+                  description: |
+                    HTTP method. Common values: GET, POST, PUT, PATCH,
+                    DELETE.
+                path:
+                  type: string
+                  description: |
+                    Path on the upstream, joined with the upstream host.
+                    May contain RFC 6570 path templates for path
+                    parameters: `/users/{id}`. The `{id}` value is
+                    pulled from the inbound request path and forwarded
+                    to the upstream verbatim.
+                contentType:
+                  type: string
+                  default: "application/json"
+                  description: |
+                    Content-Type header on the outbound request.
+                bodyField:
+                  type: string
+                  default: "body"
+                  description: |
+                    Inputs-schema field name that carries the outbound
+                    request body. Default `body`. Set empty to indicate
+                    the tool has no request body.
+                inputs:
+                  type: string
+                  default: ""
+                  description: |
+                    JSON Schema for the tool's inputs, as a JSON string.
+                    The policy validates the inbound request against
+                    this schema (subject to `validateInputs`). Typical
+                    shape: `{"type":"object","required":["body"],"properties":{"body":{"type":"object",...}}}`.
+                    Empty string disables validation for this tool.
     enforcementMode:
       type: string
       enum:
@@ -100,9 +172,10 @@ spec:
         `strict`: requests whose `(method, path)` does not correspond to
           any declared tool are rejected with HTTP 404
           `utcp.tool_not_declared`.
-        `permissive`: unmatched requests pass through unmodified, but
-          the audit log records `utcp.unmatched=true` so operators can
-          observe drift between agent traffic and the Manual.
+        `permissive`: unmatched requests are still rejected (the policy
+          owns outbound routing), but the audit log records
+          `utcp.unmatched=true` so operators can observe drift between
+          agent traffic and the Manual.
     validateInputs:
       type: boolean
       default: true
@@ -120,6 +193,14 @@ spec:
         Cap on the request body size when body validation is enabled.
         Bodies larger than this are rejected with HTTP 413
         `utcp.body_too_large`. Default 1 MiB; max 50 MiB.
+    outboundTimeoutSeconds:
+      type: integer
+      minimum: 1
+      maximum: 300
+      default: 30
+      description: |
+        Timeout applied to the outbound HTTP request to the upstream.
+        On timeout the policy returns HTTP 504 `utcp.upstream_timeout`.
     requirePrincipal:
       type: boolean
       default: false
@@ -131,8 +212,8 @@ spec:
       type: string
       default: "x-anypoint-client-id"
       description: |
-        Inbound header that carries the authenticated principal. Used in
-        audit logs and for the `requirePrincipal` enforcement check.
+        Inbound header that carries the authenticated principal. Used
+        in audit logs and for the `requirePrincipal` enforcement check.
     cacheControlHeader:
       type: string
       default: "public, max-age=60"
@@ -144,15 +225,15 @@ spec:
       type: string
       default: "x-utcp-tool"
       description: |
-        Name of the request header set on the upstream request after a
-        successful tool match. Downstream policies (rate limit, audit)
+        Name of the request header set on the outbound request after a
+        successful tool match. Audit logs and downstream observability
         can read this to scope per-tool.
     toolNamePrefix:
       type: string
       default: ""
       description: |
-        Optional prefix prepended to every auto-generated tool name in
-        the Manual. Lets multiple API instances share an agent without
+        Optional prefix prepended to every tool name in the served
+        Manual. Lets multiple API instances share an agent without
         tool-name collisions (`paymentsApi.getUser` vs `crmApi.getUser`).
   required:
-    - manualSource
+    - upstreams
