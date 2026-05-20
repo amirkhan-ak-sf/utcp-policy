@@ -32,7 +32,7 @@ metadata:
       policies (JWT, OAuth2, mTLS) configured upstream of this one in
       the policy chain; authorization to call the upstream is whatever
       the agent passes through (Authorization, x-api-key, ...).
-    category: Security
+    category: Transformation
     metadata/interfaceScope: api,resource
     metadata/capabilities/injectionPoint: inbound
 spec:
