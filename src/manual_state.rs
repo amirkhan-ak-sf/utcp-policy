@@ -1,10 +1,12 @@
 //! Compiled in-memory state for the served Manual.
 //!
-//! Builds a `Manual` from the validated `PolicyConfig.tools` (one entry
-//! per upstream tool), compiles a path-template router, and pre-renders
-//! the JSON bytes the discovery endpoint will hand out.
+//! Builds a `Manual` from the validated `PolicyConfig.tools`, compiles
+//! a path-template router, and pre-renders the JSON bytes the
+//! discovery endpoint will hand out. Each tool's
+//! `tool_call_template.url` is composed from `publicBaseUrl + path` so
+//! agents have a public address to invoke.
 
-use anyhow::{anyhow, Context};
+use anyhow::anyhow;
 use serde_json::{Map, Value};
 
 use crate::config::{PolicyConfig, ToolEntry};
@@ -28,7 +30,7 @@ impl ManualState {
 
         let mut tools = Vec::with_capacity(cfg.tools.len());
         for entry in &cfg.tools {
-            tools.push(build_tool(entry)?);
+            tools.push(build_tool(entry, &cfg.public_base_url));
         }
 
         let info = build_info(
@@ -45,11 +47,7 @@ impl ManualState {
             tools,
         };
 
-        Self::finalize(manual)
-    }
-
-    fn finalize(manual: Manual) -> anyhow::Result<Self> {
-        let router = ToolRouter::build(&manual)
+        let router = ToolRouter::build(&cfg.tools)
             .map_err(|e| anyhow!("router compilation failed: {e}"))?;
         let manual_bytes = render::to_json_bytes(&manual)
             .map_err(|e| anyhow!("manual rendering failed: {e}"))?;
@@ -61,10 +59,9 @@ impl ManualState {
     }
 }
 
-fn build_tool(entry: &ToolEntry) -> anyhow::Result<Tool> {
-    let url = join_url(&entry.upstream_url, &entry.path_template)
-        .with_context(|| format!("tool '{}': could not compose URL", entry.name))?;
-    Ok(Tool {
+fn build_tool(entry: &ToolEntry, public_base_url: &str) -> Tool {
+    let url = compose_url(public_base_url, &entry.path_template);
+    Tool {
         name: entry.name.clone(),
         description: entry.description.clone(),
         inputs: entry.inputs.clone(),
@@ -80,18 +77,22 @@ fn build_tool(entry: &ToolEntry) -> anyhow::Result<Tool> {
             body_field: entry.body_field.clone(),
             auth: None,
         }),
-    })
+    }
 }
 
-/// Concatenate upstream + path with exactly one `/` between them.
-/// Upstream may already end in a base path (`https://host/api`); tool
-/// path always starts with `/`.
-fn join_url(upstream: &str, tool_path: &str) -> anyhow::Result<String> {
-    let host = upstream.trim_end_matches('/');
-    if !tool_path.starts_with('/') {
-        return Err(anyhow!("tool path must start with '/', got '{tool_path}'"));
+/// Compose `publicBaseUrl + tool_path`. Empty `publicBaseUrl` yields
+/// the path alone (a relative URL); agents resolve it against
+/// whatever address they discovered the Manual on.
+fn compose_url(public_base_url: &str, tool_path: &str) -> String {
+    if public_base_url.is_empty() {
+        return tool_path.to_string();
     }
-    Ok(format!("{host}{tool_path}"))
+    let host = public_base_url.trim_end_matches('/');
+    if tool_path.starts_with('/') {
+        format!("{host}{tool_path}")
+    } else {
+        format!("{host}/{tool_path}")
+    }
 }
 
 fn build_info(title: &str, version: &str, description: &str) -> Option<Value> {
@@ -116,20 +117,21 @@ fn build_info(title: &str, version: &str, description: &str) -> Option<Value> {
 mod tests {
     use super::*;
 
-    fn cfg_with_tools(tools: Vec<ToolEntry>) -> PolicyConfig {
+    fn cfg_with_tools(public_base_url: &str, tools: Vec<ToolEntry>) -> PolicyConfig {
         PolicyConfig {
             discovery_path: "/utcp".into(),
             api_instance_proxy_path: String::new(),
+            public_base_url: public_base_url.into(),
+            egress_service: pdk::hl::Service::default(),
+            outbound_timeout: std::time::Duration::from_secs(30),
             utcp_version: "1.0.1".into(),
             manual_title: "SAP Bridge".into(),
             manual_info_version: "1.0.0".into(),
             manual_description: "".into(),
             tools,
-            upstream_urls: vec!["https://sap.example.com".into()],
             enforcement_mode: crate::config::EnforcementMode::Strict,
             validate_inputs: true,
             max_body_bytes: 1_048_576,
-            outbound_timeout_seconds: 30,
             require_principal: false,
             principal_header: "x-anypoint-client-id".into(),
             cache_control_header: "public, max-age=60".into(),
@@ -140,8 +142,6 @@ mod tests {
 
     fn entry(name: &str, method: &str, path: &str) -> ToolEntry {
         ToolEntry {
-            upstream_index: 0,
-            upstream_url: "https://sap.example.com".into(),
             name: name.into(),
             description: format!("{name} description"),
             method: method.into(),
@@ -157,10 +157,13 @@ mod tests {
 
     #[test]
     fn synthesises_manual_from_tools() {
-        let cfg = cfg_with_tools(vec![
-            entry("createSalesOrder", "POST", "/api/order"),
-            entry("checkInventory", "POST", "/mmbe"),
-        ]);
+        let cfg = cfg_with_tools(
+            "https://gw.example.com/erp",
+            vec![
+                entry("createSalesOrder", "POST", "/api/order"),
+                entry("checkInventory", "POST", "/mmbe"),
+            ],
+        );
         let state = ManualState::build(&cfg).unwrap();
         assert_eq!(state.manual.tools.len(), 2);
         let urls: Vec<_> = state
@@ -171,8 +174,8 @@ mod tests {
                 CallTemplate::Http(h) => h.url.clone(),
             })
             .collect();
-        assert!(urls.contains(&"https://sap.example.com/api/order".to_string()));
-        assert!(urls.contains(&"https://sap.example.com/mmbe".to_string()));
+        assert!(urls.contains(&"https://gw.example.com/erp/api/order".to_string()));
+        assert!(urls.contains(&"https://gw.example.com/erp/mmbe".to_string()));
         assert_eq!(
             state
                 .manual
@@ -185,18 +188,19 @@ mod tests {
     }
 
     #[test]
-    fn join_url_collapses_trailing_slash() {
-        assert_eq!(
-            join_url("https://h", "/path").unwrap(),
-            "https://h/path"
-        );
-        assert_eq!(
-            join_url("https://h/", "/path").unwrap(),
-            "https://h/path"
-        );
-        assert_eq!(
-            join_url("https://h/api", "/path").unwrap(),
-            "https://h/api/path"
-        );
+    fn empty_public_base_url_yields_relative_paths() {
+        let cfg = cfg_with_tools("", vec![entry("checkInventory", "POST", "/mmbe")]);
+        let state = ManualState::build(&cfg).unwrap();
+        let url = match &state.manual.tools[0].tool_call_template {
+            CallTemplate::Http(h) => h.url.clone(),
+        };
+        assert_eq!(url, "/mmbe");
+    }
+
+    #[test]
+    fn compose_url_collapses_trailing_slash() {
+        assert_eq!(compose_url("https://h", "/path"), "https://h/path");
+        assert_eq!(compose_url("https://h/", "/path"), "https://h/path");
+        assert_eq!(compose_url("https://h/api", "/path"), "https://h/api/path");
     }
 }

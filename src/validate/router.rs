@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use thiserror::Error;
 
-use crate::manual::model::{CallTemplate, Manual};
+use crate::config::ToolEntry;
 
 #[derive(Debug, Error)]
 pub enum RouterError {
@@ -57,14 +57,18 @@ pub struct ToolRouter {
 }
 
 impl ToolRouter {
-    pub fn build(manual: &Manual) -> Result<Self, RouterError> {
-        let mut routes = Vec::with_capacity(manual.tools.len());
-        let tool_names: Vec<String> = manual.tools.iter().map(|t| t.name.clone()).collect();
+    /// Build a router from validated tool entries. The matching template
+    /// comes from each entry's `path_template` (the policy-config `path`
+    /// field), not from the rendered Manual URL — the latter has scheme
+    /// and host attached for agent display and may also include the
+    /// API-instance proxy prefix.
+    pub fn build(tools: &[ToolEntry]) -> Result<Self, RouterError> {
+        let mut routes = Vec::with_capacity(tools.len());
+        let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
 
-        for (i, tool) in manual.tools.iter().enumerate() {
-            let CallTemplate::Http(http) = &tool.tool_call_template;
-            let method = http.http_method.to_ascii_uppercase();
-            let segments = compile_template(&http.url);
+        for (i, tool) in tools.iter().enumerate() {
+            let method = tool.method.to_ascii_uppercase();
+            let segments = compile_template(&tool.path_template);
             routes.push(Route {
                 tool_index: i,
                 method,
@@ -237,43 +241,22 @@ fn urldecode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manual::model::{CallTemplate, HttpCallTemplate, Manual, Tool};
 
-    fn tool(name: &str, method: &str, url: &str) -> Tool {
-        Tool {
+    fn entry(name: &str, method: &str, path: &str) -> ToolEntry {
+        ToolEntry {
             name: name.into(),
             description: String::new(),
+            method: method.into(),
+            path_template: path.into(),
+            content_type: "application/json".into(),
+            body_field: None,
             inputs: None,
-            outputs: None,
-            tags: vec![],
-            average_response_size: None,
-            tool_call_template: CallTemplate::Http(HttpCallTemplate {
-                url: url.into(),
-                http_method: method.into(),
-                content_type: "application/json".into(),
-                ..Default::default()
-            }),
-        }
-    }
-
-    fn manual(tools: Vec<Tool>) -> Manual {
-        Manual {
-            manual_version: "1.0.0".into(),
-            utcp_version: "1.0.1".into(),
-            info: None,
-            variables: None,
-            tools,
         }
     }
 
     #[test]
     fn matches_simple_get() {
-        let r = ToolRouter::build(&manual(vec![tool(
-            "getThing",
-            "GET",
-            "https://api.example.com/things/{id}",
-        )]))
-        .unwrap();
+        let r = ToolRouter::build(&[entry("getThing", "GET", "/things/{id}")]).unwrap();
         let m = r.resolve("GET", "/things/42").unwrap();
         assert_eq!(m.tool_name, "getThing");
         assert_eq!(m.path_params.get("id").map(String::as_str), Some("42"));
@@ -281,10 +264,10 @@ mod tests {
 
     #[test]
     fn literal_beats_param() {
-        let r = ToolRouter::build(&manual(vec![
-            tool("getById", "GET", "https://api.example.com/users/{id}"),
-            tool("getMe", "GET", "https://api.example.com/users/me"),
-        ]))
+        let r = ToolRouter::build(&[
+            entry("getById", "GET", "/users/{id}"),
+            entry("getMe", "GET", "/users/me"),
+        ])
         .unwrap();
         let m = r.resolve("GET", "/users/me").unwrap();
         assert_eq!(m.tool_name, "getMe");
@@ -294,45 +277,30 @@ mod tests {
 
     #[test]
     fn method_mismatch_returns_none() {
-        let r = ToolRouter::build(&manual(vec![tool(
-            "getThing",
-            "GET",
-            "https://api.example.com/things/{id}",
-        )]))
-        .unwrap();
+        let r = ToolRouter::build(&[entry("getThing", "GET", "/things/{id}")]).unwrap();
         assert!(r.resolve("POST", "/things/42").is_none());
     }
 
     #[test]
     fn segment_count_mismatch_returns_none() {
-        let r = ToolRouter::build(&manual(vec![tool(
-            "getThing",
-            "GET",
-            "https://api.example.com/things/{id}",
-        )]))
-        .unwrap();
+        let r = ToolRouter::build(&[entry("getThing", "GET", "/things/{id}")]).unwrap();
         assert!(r.resolve("GET", "/things").is_none());
         assert!(r.resolve("GET", "/things/42/extra").is_none());
     }
 
     #[test]
     fn detects_param_param_conflict() {
-        let err = ToolRouter::build(&manual(vec![
-            tool("a", "GET", "https://api.example.com/things/{id}"),
-            tool("b", "GET", "https://api.example.com/things/{slug}"),
-        ]))
+        let err = ToolRouter::build(&[
+            entry("a", "GET", "/things/{id}"),
+            entry("b", "GET", "/things/{slug}"),
+        ])
         .unwrap_err();
         assert!(matches!(err, RouterError::Conflict(..)));
     }
 
     #[test]
     fn parses_query_string() {
-        let r = ToolRouter::build(&manual(vec![tool(
-            "list",
-            "GET",
-            "https://api.example.com/things",
-        )]))
-        .unwrap();
+        let r = ToolRouter::build(&[entry("list", "GET", "/things")]).unwrap();
         let m = r.resolve("GET", "/things?limit=10&q=hello%20world").unwrap();
         assert_eq!(m.query.get("limit").map(|v| v[0].as_str()), Some("10"));
         assert_eq!(m.query.get("q").map(|v| v[0].as_str()), Some("hello world"));
@@ -340,12 +308,7 @@ mod tests {
 
     #[test]
     fn case_insensitive_method() {
-        let r = ToolRouter::build(&manual(vec![tool(
-            "list",
-            "get",
-            "https://api.example.com/things",
-        )]))
-        .unwrap();
+        let r = ToolRouter::build(&[entry("list", "get", "/things")]).unwrap();
         assert!(r.resolve("GET", "/things").is_some());
         assert!(r.resolve("get", "/things").is_some());
     }

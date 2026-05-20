@@ -17,13 +17,6 @@ pub struct Tools0Config {
     pub path: String,
 }
 #[derive(Deserialize, Clone, Debug)]
-pub struct Upstreams0Config {
-    #[serde(alias = "host", deserialize_with = "pdk::serde::deserialize_service")]
-    pub host: pdk::hl::Service,
-    #[serde(alias = "tools")]
-    pub tools: Option<Vec<Tools0Config>>,
-}
-#[derive(Deserialize, Clone, Debug)]
 pub struct Config {
     #[serde(alias = "apiInstanceProxyPath")]
     pub api_instance_proxy_path: Option<String>,
@@ -31,6 +24,11 @@ pub struct Config {
     pub cache_control_header: Option<String>,
     #[serde(alias = "discoveryPath")]
     pub discovery_path: Option<String>,
+    #[serde(
+        alias = "egressBaseUrl",
+        deserialize_with = "pdk::serde::deserialize_service"
+    )]
+    pub egress_base_url: pdk::hl::Service,
     #[serde(alias = "enforcementMode")]
     pub enforcement_mode: Option<String>,
     #[serde(alias = "manualDescription")]
@@ -41,18 +39,20 @@ pub struct Config {
     pub manual_title: Option<String>,
     #[serde(alias = "maxBodyBytes")]
     pub max_body_bytes: Option<i64>,
-    #[serde(alias = "outboundTimeoutSeconds")]
-    pub outbound_timeout_seconds: Option<i64>,
+    #[serde(alias = "outboundTimeoutMs")]
+    pub outbound_timeout_ms: Option<i64>,
     #[serde(alias = "principalHeader")]
     pub principal_header: Option<String>,
+    #[serde(alias = "publicBaseUrl")]
+    pub public_base_url: Option<String>,
     #[serde(alias = "requirePrincipal")]
     pub require_principal: Option<bool>,
     #[serde(alias = "toolHeaderName")]
     pub tool_header_name: Option<String>,
     #[serde(alias = "toolNamePrefix")]
     pub tool_name_prefix: Option<String>,
-    #[serde(alias = "upstreams")]
-    pub upstreams: Vec<Upstreams0Config>,
+    #[serde(alias = "tools")]
+    pub tools: Vec<Tools0Config>,
     #[serde(alias = "utcpVersion")]
     pub utcp_version: Option<String>,
     #[serde(alias = "validateInputs")]
@@ -67,9 +67,7 @@ fn init(abi: &dyn pdk::flex_abi::api::FlexAbi) -> Result<(), anyhow::Error> {
                 String::from_utf8_lossy(abi.get_configuration()), err
             )
         })?;
-    for current in config.upstreams {
-        abi.service_create(current.host)?;
-    }
+    abi.service_create(config.egress_base_url)?;
     abi.setup()?;
     Ok(())
 }

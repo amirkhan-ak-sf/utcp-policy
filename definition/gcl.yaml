@@ -6,17 +6,21 @@ metadata:
     title: UTCP Bridge
     description: |
       Universal Tool Calling Protocol (UTCP) gateway-side validator and
-      router.
+      tagger.
 
       Hosts a UTCP "Manual" at a discovery path (default `/utcp`) and
-      routes inbound agent traffic to one or more upstream services. The
-      Manual is built from the configured `upstreams[]` — each upstream
-      is a host (registered as a PDK Service so the gateway resolves DNS
-      and TLS) and a list of tools. Each tool maps to one HTTP route
-      (method + path) on the upstream and contributes one entry to the
-      Manual's `tools[]` array. Inbound caller headers and request body
-      are forwarded onward unchanged so upstream authorization /
-      tracing flows through transparently.
+      validates inbound agent traffic against the configured `tools[]`
+      list. Each tool maps to one HTTP route (method + path) on this
+      API instance. The policy does not issue outbound HTTP itself —
+      after validation it lets Flex Gateway forward the request to the
+      API instance's configured implementation URI as usual, so the
+      same network path the API instance already uses is the one the
+      tool calls travel over.
+
+      One UTCP Bridge policy fronts one API instance / one upstream.
+      Multi-upstream agent surfaces are composed by stacking UTCP
+      Bridge on each API instance and federating the Manuals at a
+      higher layer.
 
       Validates inbound calls: the request must correspond to a declared
       tool and (when `validateInputs=true`) satisfy the tool's JSON
@@ -24,11 +28,10 @@ metadata:
       `x-utcp-tool` header so downstream rate-limit and audit policies
       can scope by tool name.
 
-      The policy never holds upstream credentials. Authentication of the
-      agent itself is delegated to other Omni Gateway policies (JWT,
-      OAuth2, mTLS) configured upstream of this one in the policy chain;
-      authorization to call the upstream is whatever the agent passes
-      through (Authorization, x-api-key, ...).
+      Authentication of the agent is delegated to other Omni Gateway
+      policies (JWT, OAuth2, mTLS) configured upstream of this one in
+      the policy chain; authorization to call the upstream is whatever
+      the agent passes through (Authorization, x-api-key, ...).
     category: Security
     metadata/interfaceScope: api,resource
     metadata/capabilities/injectionPoint: inbound
@@ -48,15 +51,40 @@ spec:
       type: string
       default: ""
       description: |
-        Optional path prefix that the API instance proxies under (the
-        "Implementation URI" path component in API Manager). When set,
-        the policy strips this prefix from the inbound request path
-        before matching against tool paths and before computing the
-        outbound URL. Example: API instance is at
-        `https://gw/sap-orders-utcp`, tool path is `/api/order`. Set
-        `apiInstanceProxyPath=/sap-orders-utcp` so the inbound path
-        `/sap-orders-utcp/api/order` matches the tool `/api/order`.
-        Leave empty if the API instance is mounted at root.
+        Optional path prefix that the bridge API instance proxies under
+        (the listener-path component of its consumer URL). When set, the
+        policy strips this prefix from the inbound request path before
+        matching against tool paths. Example: bridge consumer URL is
+        `https://gw/erp-utcp/`, tool path is `/sap-orders/api/order`.
+        Set `apiInstanceProxyPath=/erp-utcp` so the inbound path
+        `/erp-utcp/sap-orders/api/order` matches the tool. Leave empty
+        if the bridge is mounted at root.
+    egressBaseUrl:
+      type: string
+      format: service
+      description: |
+        Host-only base URL used for outbound tool calls. Registered as
+        an Envoy upstream cluster (host-only, no path). Typically the
+        gateway's own external hostname so the bridge stacks against
+        sibling API instances on the same gateway and tool calls travel
+        the gateway's normal routing path. Each matched tool's `path`
+        is appended verbatim to this host when forwarding.
+    outboundTimeoutMs:
+      type: integer
+      minimum: 100
+      maximum: 600000
+      default: 30000
+      description: |
+        Per-call timeout (ms) on outbound tool requests to
+        `egressBaseUrl`.
+    publicBaseUrl:
+      type: string
+      default: ""
+      description: |
+        Public consumer URL of the API instance, used to compose
+        `tool_call_template.url` in the served Manual so agents know the
+        public address to invoke. Typically `https://<gateway>/<proxy>`.
+        When empty, the Manual emits relative URLs (just the tool path).
     utcpVersion:
       type: string
       default: "1.0.1"
@@ -79,89 +107,67 @@ spec:
       default: ""
       description: |
         `info.description` of the synthesised Manual. Optional.
-    upstreams:
+    tools:
       type: array
       default: []
       description: |
-        Upstream hosts and the tools they serve. In API Manager this
-        renders as a list with an Add button: each entry is one
-        upstream + one or more tools below it. The policy issues
-        outbound HTTP to the upstream `host` directly using the PDK
-        HttpClient, so the Flex API instance's own upstream URL does
-        not matter for routing — point it at any reachable host (e.g.
-        `https://example.com`) and define the real targets here.
+        Tools served by this API instance. In API Manager this renders
+        as a list with an Add button: each entry is one tool. Every
+        tool maps to one HTTP route (method + path) the API instance
+        already accepts; the policy validates the inbound request, tags
+        it, and lets Flex Gateway forward as normal.
       items:
         type: object
         required:
-          - host
+          - name
+          - path
         properties:
-          host:
+          name:
             type: string
-            format: service
             description: |
-              Upstream URL (scheme + host, optionally + base path).
-              Registered as a PDK Service at policy load so the gateway
-              resolves DNS and TLS. Example:
-              `https://sap-orders-sys-api.example.com`.
-          tools:
-            type: array
-            default: []
+              Tool name. Used to route inbound requests and emitted on
+              the `<toolHeaderName>` header (default `x-utcp-tool`).
+              Must be unique within the policy.
+          description:
+            type: string
+            default: ""
             description: |
-              Tools served on this upstream. Each entry contributes one
-              tool to the Manual.
-            items:
-              type: object
-              required:
-                - name
-                - path
-              properties:
-                name:
-                  type: string
-                  description: |
-                    Tool name. Used to route inbound requests and
-                    emitted on the `<toolHeaderName>` header (default
-                    `x-utcp-tool`). Should be unique across the policy.
-                description:
-                  type: string
-                  default: ""
-                  description: |
-                    Free-form description. Surfaces to agents in the
-                    Manual.
-                method:
-                  type: string
-                  default: "POST"
-                  description: |
-                    HTTP method. Common values: GET, POST, PUT, PATCH,
-                    DELETE.
-                path:
-                  type: string
-                  description: |
-                    Path on the upstream, joined with the upstream host.
-                    May contain RFC 6570 path templates for path
-                    parameters: `/users/{id}`. The `{id}` value is
-                    pulled from the inbound request path and forwarded
-                    to the upstream verbatim.
-                contentType:
-                  type: string
-                  default: "application/json"
-                  description: |
-                    Content-Type header on the outbound request.
-                bodyField:
-                  type: string
-                  default: "body"
-                  description: |
-                    Inputs-schema field name that carries the outbound
-                    request body. Default `body`. Set empty to indicate
-                    the tool has no request body.
-                inputs:
-                  type: string
-                  default: ""
-                  description: |
-                    JSON Schema for the tool's inputs, as a JSON string.
-                    The policy validates the inbound request against
-                    this schema (subject to `validateInputs`). Typical
-                    shape: `{"type":"object","required":["body"],"properties":{"body":{"type":"object",...}}}`.
-                    Empty string disables validation for this tool.
+              Free-form description. Surfaces to agents in the Manual.
+          method:
+            type: string
+            default: "POST"
+            description: |
+              HTTP method. Common values: GET, POST, PUT, PATCH, DELETE.
+          path:
+            type: string
+            description: |
+              Path on the API instance (after `apiInstanceProxyPath`
+              stripping). May contain RFC 6570 path templates for path
+              parameters: `/users/{id}`. The `{id}` value is pulled
+              from the inbound request path and exposed to schema
+              validation under that key.
+          contentType:
+            type: string
+            default: "application/json"
+            description: |
+              Content-Type advertised in the served Manual for this
+              tool.
+          bodyField:
+            type: string
+            default: "body"
+            description: |
+              Inputs-schema field name that carries the request body.
+              Default `body`. Set empty to indicate the tool has no
+              request body.
+          inputs:
+            type: string
+            default: ""
+            description: |
+              JSON Schema for the tool's inputs, as a JSON string. The
+              policy validates the inbound request against this schema
+              (subject to `validateInputs`). Typical shape:
+              `{"type":"object","required":["body"],"properties":{"body":{"type":"object",...}}}`.
+              Empty string disables validation for this tool.
     enforcementMode:
       type: string
       enum:
@@ -172,18 +178,17 @@ spec:
         `strict`: requests whose `(method, path)` does not correspond to
           any declared tool are rejected with HTTP 404
           `utcp.tool_not_declared`.
-        `permissive`: unmatched requests are still rejected (the policy
-          owns outbound routing), but the audit log records
-          `utcp.unmatched=true` so operators can observe drift between
-          agent traffic and the Manual.
+        `permissive`: unmatched requests pass through to the upstream
+          and the audit log records `utcp.unmatched=true` so operators
+          can observe drift between agent traffic and the Manual.
     validateInputs:
       type: boolean
       default: true
       description: |
         Validate the request body / query / path / header against the
-        matched tool's `inputs` JSON Schema. When false, the policy only
-        does routing and tagging — useful when the schemas are noisy and
-        the operator wants observability without enforcement.
+        matched tool's `inputs` JSON Schema. When false, the policy
+        only does routing and tagging — useful when the schemas are
+        noisy and the operator wants observability without enforcement.
     maxBodyBytes:
       type: integer
       minimum: 1024
@@ -193,14 +198,6 @@ spec:
         Cap on the request body size when body validation is enabled.
         Bodies larger than this are rejected with HTTP 413
         `utcp.body_too_large`. Default 1 MiB; max 50 MiB.
-    outboundTimeoutSeconds:
-      type: integer
-      minimum: 1
-      maximum: 300
-      default: 30
-      description: |
-        Timeout applied to the outbound HTTP request to the upstream.
-        On timeout the policy returns HTTP 504 `utcp.upstream_timeout`.
     requirePrincipal:
       type: boolean
       default: false
@@ -225,7 +222,7 @@ spec:
       type: string
       default: "x-utcp-tool"
       description: |
-        Name of the request header set on the outbound request after a
+        Name of the request header set on the request after a
         successful tool match. Audit logs and downstream observability
         can read this to scope per-tool.
     toolNamePrefix:
@@ -236,4 +233,5 @@ spec:
         Manual. Lets multiple API instances share an agent without
         tool-name collisions (`paymentsApi.getUser` vs `crmApi.getUser`).
   required:
-    - upstreams
+    - tools
+    - egressBaseUrl

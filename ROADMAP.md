@@ -5,7 +5,7 @@ sketch of the chosen approach, and pointers into the code where the seam
 already exists. Items are grouped roughly by theme; priority and ordering
 will fall out of operator feedback.
 
-Last updated: 2026-05-20
+Last updated: 2026-05-20 (added items 10–12: `outputs`, `headers`/`header_fields`, `auth`)
 
 ---
 
@@ -205,7 +205,98 @@ plumbing.
 
 ---
 
-## 10. Multi-instance Manual federation
+## 10. Tool `outputs` JSON Schema in the served Manual
+
+**Status:** v0.3 emits no `outputs` field on tools (`src/manual/model.rs`
+defines it; `src/manual_state.rs::build_tool` always writes `None`). The
+UTCP spec defines `Tool.outputs` as a `JsonSchema` describing the
+response body shape so agents/LLMs can plan multi-step workflows
+without sampling a real call first.
+
+**Plan sketch:**
+  * Add an `outputs` field to the per-tool config in `definition/gcl.yaml`
+    (string-encoded JSON Schema, mirroring how `inputs` is configured).
+  * Surface it on `ToolEntry` (`src/config.rs`) and pass it through in
+    `build_tool` (`src/manual_state.rs::build_tool`).
+  * For OpenAPI-derived tools, copy the `200`/`2xx` response schema into
+    `outputs` automatically.
+  * Outputs is *descriptive only*; do not validate upstream responses
+    against it (would break streaming and add CPU on the response path).
+
+**Code seams:**
+  * `Tool { ..., pub outputs: Option<Value>, ... }` in
+    `src/manual/model.rs` is already in place.
+
+---
+
+## 11. HTTP `headers` and `header_fields` declarations
+
+**Status:** the served HTTP `tool_call_template` always emits empty
+`headers` and `header_fields`. The UTCP spec lets a Manual declare:
+  * `headers` — a static map of header name → value the agent should
+    set on every call to this tool.
+  * `header_fields` — a list of input parameter names that should be
+    sent as headers (rather than body or query).
+
+Today operators rely on the agent sending the correct headers blind.
+
+**Plan sketch:**
+  * Per-tool config: `headers: { "X-Tenant": "${TENANT}" }`,
+    `headerFields: ["request_id", "trace_id"]`.
+  * Render both verbatim into `HttpCallTemplate` so the served Manual is
+    spec-conformant.
+  * On the request path, when `validateInputs=true`, lift declared
+    `header_fields` from inbound headers into the synthetic value used
+    for schema validation (today only path params and query are
+    lifted).
+  * `${VAR}` substitution rules for `headers` follow the same env-var
+    interpolation as the `auth` block (item 12).
+
+**Code seams:**
+  * `HttpCallTemplate.headers` and `HttpCallTemplate.header_fields` in
+    `src/manual/model.rs` are already typed correctly.
+  * `build_synthetic_value` in `src/lib.rs` is the existing point where
+    `header_fields` should be merged for validation.
+
+---
+
+## 12. `auth` block + `${ENV_VAR}` substitution
+
+**Status:** the served Manual emits no `auth` block. The bridge
+forwards inbound `Authorization` (and any other) header transparently,
+so the *agent* must already hold an upstream credential. UTCP's design
+expects the Manual to declare `auth` so the agent's UTCP client can
+fill in the credential from its own env / vault before calling.
+
+**Why:** without this, every agent operator has to plumb credentials
+out-of-band. With it, the bridge tells the agent "send `X-API-Key:
+${SAP_KEY}`" and the client substitutes from its environment.
+
+**Plan sketch:**
+  * Per-tool config: `auth: { authType: "api_key", varName: "X-API-Key",
+    location: "header", apiKey: "${SAP_KEY}" }`. Support `api_key`,
+    `basic`, `oauth2` per the spec.
+  * Render the auth block into `HttpCallTemplate.auth` verbatim (the
+    `${VAR}` placeholder is *not* resolved by the bridge — it's resolved
+    client-side, exactly as the spec mandates).
+  * Validation rule: refuse to load if the policy config contains a
+    literal credential where a `${VAR}` placeholder is expected
+    (defence-in-depth so secrets don't end up in the served Manual by
+    accident).
+  * Audit: log when `auth` is declared but the inbound request lacks
+    the corresponding header — agent misbehaviour signal.
+
+**Code seams:**
+  * `HttpCallTemplate.auth: Option<Value>` already exists in
+    `src/manual/model.rs`.
+  * `src/manual_state.rs::build_tool` is the single place to populate it.
+
+**Security note:** never reflect literal secrets in the served Manual —
+render auth values as `${ENV_VAR}` placeholders only.
+
+---
+
+## 13. Multi-instance Manual federation
 
 **Why:** when an organisation has multiple UTCP Bridge instances
 fronting different upstreams, agents currently fetch each Manual

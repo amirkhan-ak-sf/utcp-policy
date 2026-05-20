@@ -2,47 +2,42 @@
 //!
 //! Two layers:
 //!
-//!   codegen `Config` (deserialized from operator JSON, owns
-//!   `pdk::hl::Service` values that the gateway can route through)
+//!   codegen `Config` (deserialized from operator JSON)
 //!     -> `PolicyConfig` (validated, normalized, host-testable)
 //!
 //! Validation runs once at policy load via `PolicyConfig::from_config`.
-//! Bad config (no upstreams, missing tool path, malformed inputs schema)
+//! Bad config (no tools, missing tool path, malformed inputs schema)
 //! fails policy load with a clear error instead of every request.
 
+use std::time::Duration;
+
+use pdk::hl::Service;
 use thiserror::Error;
 
 use crate::generated::config::Config;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("at least one entry is required in 'upstreams'")]
-    MissingUpstreams,
+    #[error("at least one entry is required in 'tools'")]
+    MissingTools,
     #[error("enforcementMode must be one of: strict, permissive (got '{0}')")]
     BadEnforcementMode(String),
-    #[error("upstreams[{upstream}].tools is empty")]
-    EmptyTools { upstream: usize },
-    #[error("upstreams[{upstream}].tools[{tool}].name is required")]
-    MissingToolName { upstream: usize, tool: usize },
-    #[error("upstreams[{upstream}].tools[{tool}] ({name}): path is required and must start with '/'")]
-    BadToolPath {
-        upstream: usize,
-        tool: usize,
-        name: String,
-    },
-    #[error("upstreams[{upstream}].tools[{tool}] ({name}): inputs failed to parse as JSON: {reason}")]
+    #[error("tools[{tool}].name is required")]
+    MissingToolName { tool: usize },
+    #[error("tools[{tool}] ({name}): path is required and must start with '/'")]
+    BadToolPath { tool: usize, name: String },
+    #[error("tools[{tool}] ({name}): inputs failed to parse as JSON: {reason}")]
     BadToolInputsJson {
-        upstream: usize,
         tool: usize,
         name: String,
         reason: String,
     },
-    #[error("duplicate tool name '{0}' across upstreams; tool names must be unique")]
+    #[error("duplicate tool name '{0}'; tool names must be unique")]
     DuplicateToolName(String),
     #[error("maxBodyBytes out of range [1024, 52428800]: {0}")]
     BadMaxBodyBytes(i64),
-    #[error("outboundTimeoutSeconds out of range [1, 300]: {0}")]
-    BadOutboundTimeout(i64),
+    #[error("outboundTimeoutMs out of range [100, 600000]: {0}")]
+    BadOutboundTimeoutMs(i64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,13 +52,9 @@ impl EnforcementMode {
     }
 }
 
-/// One tool, post-validation. The PDK Service handle for the upstream
-/// lives in `PolicyConfig::services[upstream_index]` so the request
-/// filter can borrow it for the outbound HttpClient call.
+/// One tool, post-validation.
 #[derive(Debug, Clone)]
 pub struct ToolEntry {
-    pub upstream_index: usize,
-    pub upstream_url: String,
     pub name: String,
     pub description: String,
     pub method: String,
@@ -77,16 +68,17 @@ pub struct ToolEntry {
 pub struct PolicyConfig {
     pub discovery_path: String,
     pub api_instance_proxy_path: String,
+    pub public_base_url: String,
+    pub egress_service: Service,
+    pub outbound_timeout: Duration,
     pub utcp_version: String,
     pub manual_title: String,
     pub manual_info_version: String,
     pub manual_description: String,
     pub tools: Vec<ToolEntry>,
-    pub upstream_urls: Vec<String>,
     pub enforcement_mode: EnforcementMode,
     pub validate_inputs: bool,
     pub max_body_bytes: usize,
-    pub outbound_timeout_seconds: u32,
     pub require_principal: bool,
     pub principal_header: String,
     pub cache_control_header: String,
@@ -96,8 +88,8 @@ pub struct PolicyConfig {
 
 impl PolicyConfig {
     pub fn from_config(c: &Config) -> Result<Self, ConfigError> {
-        if c.upstreams.is_empty() {
-            return Err(ConfigError::MissingUpstreams);
+        if c.tools.is_empty() {
+            return Err(ConfigError::MissingTools);
         }
 
         let enforcement_mode = match c.enforcement_mode.as_deref().unwrap_or("strict") {
@@ -111,87 +103,68 @@ impl PolicyConfig {
             v => return Err(ConfigError::BadMaxBodyBytes(v)),
         };
 
-        let outbound_timeout_seconds = match c.outbound_timeout_seconds.unwrap_or(30) {
-            v if (1..=300).contains(&v) => v as u32,
-            v => return Err(ConfigError::BadOutboundTimeout(v)),
+        let outbound_timeout_ms = match c.outbound_timeout_ms.unwrap_or(30_000) {
+            v if (100..=600_000).contains(&v) => v as u64,
+            v => return Err(ConfigError::BadOutboundTimeoutMs(v)),
         };
 
-        let mut tools: Vec<ToolEntry> = Vec::new();
-        let mut upstream_urls: Vec<String> = Vec::with_capacity(c.upstreams.len());
+        let mut tools: Vec<ToolEntry> = Vec::with_capacity(c.tools.len());
 
-        for (u_idx, upstream) in c.upstreams.iter().enumerate() {
-            let upstream_url = upstream.host.uri().to_string();
-            upstream_urls.push(upstream_url.clone());
-
-            let tool_list = upstream.tools.as_deref().unwrap_or(&[]);
-            if tool_list.is_empty() {
-                return Err(ConfigError::EmptyTools { upstream: u_idx });
+        for (t_idx, raw) in c.tools.iter().enumerate() {
+            let name = raw.name.trim().to_string();
+            if name.is_empty() {
+                return Err(ConfigError::MissingToolName { tool: t_idx });
             }
-
-            for (t_idx, raw) in tool_list.iter().enumerate() {
-                let name = raw.name.trim().to_string();
-                if name.is_empty() {
-                    return Err(ConfigError::MissingToolName {
-                        upstream: u_idx,
-                        tool: t_idx,
-                    });
-                }
-                let path = raw.path.trim();
-                if path.is_empty() || !path.starts_with('/') {
-                    return Err(ConfigError::BadToolPath {
-                        upstream: u_idx,
-                        tool: t_idx,
-                        name,
-                    });
-                }
-                let inputs = match raw.inputs.as_deref().map(str::trim) {
-                    Some(s) if !s.is_empty() => Some(
-                        serde_json::from_str::<serde_json::Value>(s).map_err(|e| {
-                            ConfigError::BadToolInputsJson {
-                                upstream: u_idx,
-                                tool: t_idx,
-                                name: name.clone(),
-                                reason: e.to_string(),
-                            }
-                        })?,
-                    ),
-                    _ => None,
-                };
-                let body_field_raw = raw
-                    .body_field
-                    .clone()
-                    .unwrap_or_else(|| "body".to_string());
-                let body_field = if body_field_raw.is_empty() {
-                    None
-                } else {
-                    Some(body_field_raw)
-                };
-                tools.push(ToolEntry {
-                    upstream_index: u_idx,
-                    upstream_url: upstream_url.clone(),
+            let path = raw.path.trim();
+            if path.is_empty() || !path.starts_with('/') {
+                return Err(ConfigError::BadToolPath {
+                    tool: t_idx,
                     name,
-                    description: raw.description.clone().unwrap_or_default(),
-                    method: raw
-                        .method
-                        .clone()
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| "POST".to_string())
-                        .to_ascii_uppercase(),
-                    path_template: path.to_string(),
-                    content_type: raw
-                        .content_type
-                        .clone()
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| "application/json".to_string()),
-                    body_field,
-                    inputs,
                 });
             }
+            let inputs = match raw.inputs.as_deref().map(str::trim) {
+                Some(s) if !s.is_empty() => Some(
+                    serde_json::from_str::<serde_json::Value>(s).map_err(|e| {
+                        ConfigError::BadToolInputsJson {
+                            tool: t_idx,
+                            name: name.clone(),
+                            reason: e.to_string(),
+                        }
+                    })?,
+                ),
+                _ => None,
+            };
+            let body_field_raw = raw
+                .body_field
+                .clone()
+                .unwrap_or_else(|| "body".to_string());
+            let body_field = if body_field_raw.is_empty() {
+                None
+            } else {
+                Some(body_field_raw)
+            };
+            tools.push(ToolEntry {
+                name,
+                description: raw.description.clone().unwrap_or_default(),
+                method: raw
+                    .method
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "POST".to_string())
+                    .to_ascii_uppercase(),
+                path_template: path.to_string(),
+                content_type: raw
+                    .content_type
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "application/json".to_string()),
+                body_field,
+                inputs,
+            });
         }
 
-        // Tool names must be globally unique — they're how callers
-        // identify routes, and the audit/header tagging assumes a 1:1
-        // mapping.
+        // Tool names must be unique — they're how callers identify
+        // routes, and the audit/header tagging assumes a 1:1 mapping.
         for i in 0..tools.len() {
             for j in (i + 1)..tools.len() {
                 if tools[i].name == tools[j].name {
@@ -216,6 +189,13 @@ impl PolicyConfig {
             api_instance_proxy_path: normalize_proxy_path(
                 c.api_instance_proxy_path.as_deref().unwrap_or(""),
             ),
+            public_base_url: c
+                .public_base_url
+                .clone()
+                .map(|s| s.trim_end_matches('/').to_string())
+                .unwrap_or_default(),
+            egress_service: c.egress_base_url.clone(),
+            outbound_timeout: Duration::from_millis(outbound_timeout_ms),
             utcp_version: c
                 .utcp_version
                 .clone()
@@ -225,11 +205,9 @@ impl PolicyConfig {
             manual_info_version: c.manual_info_version.clone().unwrap_or_default(),
             manual_description: c.manual_description.clone().unwrap_or_default(),
             tools,
-            upstream_urls,
             enforcement_mode,
             validate_inputs: c.validate_inputs.unwrap_or(true),
             max_body_bytes,
-            outbound_timeout_seconds,
             require_principal: c.require_principal.unwrap_or(false),
             principal_header: c
                 .principal_header
@@ -275,12 +253,6 @@ fn normalize_proxy_path(s: &str) -> String {
 mod tests {
     use super::*;
 
-    /// `Config` is mostly Option<_>; build a minimal valid one.
-    /// Unfortunately the codegen `Upstreams0Config` carries a
-    /// `pdk::hl::Service` we can't construct outside of a real PDK
-    /// runtime, so our host-side tests exercise `normalize_proxy_path`
-    /// and the smaller pure helpers. Behavioural validation lives in
-    /// the integration tests under `tests/`.
     #[test]
     fn normalize_proxy_path_handles_edges() {
         assert_eq!(normalize_proxy_path(""), "");

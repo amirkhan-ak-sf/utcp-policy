@@ -8,18 +8,18 @@
 //!   2. If `requirePrincipal=true` and the configured principal header
 //!      is absent, short-circuit with 401 `utcp.unauthenticated`.
 //!   3. Otherwise resolve `(method, path)` against the compiled router.
-//!         * No match -> 404 `utcp.tool_not_declared`.
+//!         * No match -> 404 `utcp.tool_not_declared` (strict) or
+//!           pass-through with audit (permissive).
 //!         * Match -> validate the body against the tool's input schema
-//!           (when `validateInputs=true`), then issue an outbound HTTP
-//!           request to the matched upstream's PDK Service. The
-//!           upstream response is returned to the caller via
-//!           `Flow::Break`.
+//!           (when `validateInputs=true`), tag the request with
+//!           `<toolHeaderName>: <name>`, then forward the request to
+//!           `<egressBaseUrl><tool.path>` via the PDK HttpClient and
+//!           short-circuit (`Flow::Break`) with the upstream response.
 //!
-//! Header forwarding: every inbound header except a small allow-deny
-//! list of hop-by-hop / proxy-internal headers is copied to the
-//! outbound request, including `Authorization` and any custom auth
-//! headers the agent supplies. The policy itself never holds upstream
-//! credentials.
+//! The bridge does not let Flex Gateway forward the request through its
+//! own upstream cluster. Instead it issues an outbound call to
+//! `egressBaseUrl` (typically the gateway's own hostname) so the bridge
+//! can stack against sibling API instances on the same gateway.
 
 mod audit;
 mod config;
@@ -29,32 +29,15 @@ mod manual_state;
 pub mod validate;
 
 use std::rc::Rc;
-use std::time::Duration;
 
 use anyhow::anyhow;
 use pdk::cache::CacheBuilder;
 use pdk::hl::*;
 use pdk::logger;
 
-use crate::config::{PolicyConfig, ToolEntry};
+use crate::config::PolicyConfig;
 use crate::generated::config::Config;
 use crate::manual_state::ManualState;
-
-/// Hop-by-hop / proxy-internal headers we never forward upstream.
-/// Excludes `Authorization` (forwarded) and the `:pseudo-headers`
-/// (handled separately by the HttpClient).
-const SKIP_HEADERS: &[&str] = &[
-    "host",
-    "connection",
-    "keep-alive",
-    "transfer-encoding",
-    "content-length",
-    "upgrade",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-];
 
 #[entrypoint]
 pub async fn configure(
@@ -72,37 +55,26 @@ pub async fn configure(
         anyhow!("utcp-manual-validator: failed to build Manual at policy load: {e}")
     })?;
 
-    // Hold the registered Service handles for outbound dispatch. Index
-    // matches `cfg.upstream_urls` and `ToolEntry.upstream_index`.
-    let services: Vec<pdk::hl::Service> = raw
-        .upstreams
-        .iter()
-        .map(|u| u.host.clone())
-        .collect();
-
     logger::info!(
-        "utcp-manual-validator: loaded {} upstream(s) / {} tool(s); discoveryPath='{}' apiInstanceProxyPath='{}' enforcement={:?} validateInputs={}",
-        services.len(),
+        "utcp-manual-validator: loaded {} tool(s); discoveryPath='{}' apiInstanceProxyPath='{}' egress='{}' enforcement={:?} validateInputs={}",
         state.manual.tools.len(),
         cfg.discovery_path,
         cfg.api_instance_proxy_path,
+        cfg.egress_service.uri().authority(),
         cfg.enforcement_mode,
         cfg.validate_inputs,
     );
 
     let cfg = Rc::new(cfg);
     let state = Rc::new(state);
-    let services = Rc::new(services);
 
     let request_cfg = cfg.clone();
     let request_state = state.clone();
-    let request_services = services.clone();
 
     let filter = on_request(move |request: RequestHeadersState, client: HttpClient| {
         let cfg = request_cfg.clone();
         let state = request_state.clone();
-        let services = request_services.clone();
-        async move { request_filter(request, client, cfg, state, services).await }
+        async move { request_filter(request, cfg, state, client).await }
     });
 
     launcher.launch(filter).await?;
@@ -111,10 +83,9 @@ pub async fn configure(
 
 async fn request_filter(
     request: RequestHeadersState,
-    client: HttpClient,
     cfg: Rc<PolicyConfig>,
     state: Rc<ManualState>,
-    services: Rc<Vec<pdk::hl::Service>>,
+    client: HttpClient,
 ) -> Flow<()> {
     let method = request.method();
     let raw_path = request.path();
@@ -165,32 +136,40 @@ async fn request_filter(
 
     let resolved = state.router.resolve(&method, &local_path_with_query);
     let Some(resolved) = resolved else {
-        logger::warn!(
-            "utcp-manual-validator: rejecting unmatched {} {} (local '{}')",
+        if cfg.enforcement_mode.is_strict() {
+            logger::warn!(
+                "utcp-manual-validator: rejecting unmatched {} {} (local '{}')",
+                method,
+                bare_path,
+                local_path
+            );
+            return Flow::Break(
+                Response::new(404)
+                    .with_headers(vec![("content-type".into(), "application/json".into())])
+                    .with_body(audit::render_error_body("utcp.tool_not_declared")),
+            );
+        }
+        logger::info!(
+            "utcp-manual-validator: passing through unmatched {} {} (utcp.unmatched=true)",
             method,
-            bare_path,
-            local_path
+            bare_path
         );
-        return Flow::Break(
-            Response::new(404)
-                .with_headers(vec![("content-type".into(), "application/json".into())])
-                .with_body(audit::render_error_body("utcp.tool_not_declared")),
-        );
+        return Flow::Continue(());
     };
 
     let tool_name = resolved.tool_name.to_string();
     let tool_index = resolved.tool_index;
     let path_params = resolved.path_params.clone();
+    let query = resolved.query.clone();
 
-    request.handler().remove_header(&cfg.tool_header_name);
-    request.handler().set_header(&cfg.tool_header_name, &tool_name);
-
-    // 4) Capture inbound headers up-front; `into_body_state` drops
-    //    access to the headers handler.
-    let inbound_headers: Vec<(String, String)> = request.handler().headers();
+    let tool_entry = cfg.tools[tool_index].clone();
     let has_body = request.contains_body();
-    let tool_entry: ToolEntry = cfg.tools[tool_index].clone();
 
+    // Capture forwardable headers BEFORE consuming `request` for body.
+    let forward_headers = collect_forward_headers(&request, &cfg.tool_header_name, &tool_name);
+
+    // 4) Read body (when present) and validate. We read regardless of
+    //    schema presence so we can forward the body upstream.
     let body_bytes: Vec<u8> = if has_body {
         let body_state = request.into_body_state().await;
         let bytes = body_state.handler().body();
@@ -212,9 +191,7 @@ async fn request_filter(
         Vec::new()
     };
 
-    // 5) Schema validation against the synthetic
-    //    `{path_params..., query..., body: ...}` value.
-    if cfg.validate_inputs {
+    if cfg.validate_inputs && tool_entry.inputs.is_some() {
         let body_value = if body_bytes.is_empty() {
             None
         } else {
@@ -223,7 +200,7 @@ async fn request_filter(
                     .unwrap_or(serde_json::Value::Null),
             )
         };
-        let synthetic = build_synthetic_value(&resolved, body_value);
+        let synthetic = build_synthetic_value(&path_params, &query, body_value);
         if let Some(schema) = &tool_entry.inputs {
             let violations = validate::validate_inputs(schema, &synthetic);
             if !violations.is_empty() {
@@ -245,105 +222,58 @@ async fn request_filter(
         }
     }
 
-    // 6) Compose outbound URL: resolve {path} placeholders, then
-    //    re-attach the inbound query string.
-    let outbound_path = resolve_path_template(&tool_entry.path_template, &path_params);
-    let outbound_path = match raw_path.split_once('?') {
-        Some((_, q)) if !q.is_empty() => format!("{outbound_path}?{q}"),
-        _ => outbound_path,
-    };
-
-    // 7) Build forwarded headers from the inbound request (captured
-    //    pre-body-state above).
-    let mut fwd_headers: Vec<(String, String)> = Vec::with_capacity(inbound_headers.len() + 2);
-    for (k, v) in &inbound_headers {
-        let lower = k.to_ascii_lowercase();
-        if lower.starts_with(':') {
-            // proxy-wasm pseudo-headers; HttpClient writes its own.
-            continue;
-        }
-        if SKIP_HEADERS.iter().any(|h| *h == lower) {
-            continue;
-        }
-        fwd_headers.push((k.clone(), v.clone()));
-    }
-    // Override / set content-type for the outbound call.
-    fwd_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-type"));
-    fwd_headers.push(("content-type".into(), tool_entry.content_type.clone()));
-    fwd_headers.push((cfg.tool_header_name.clone(), tool_name.clone()));
-
-    let header_refs: Vec<(&str, &str)> = fwd_headers
+    // 5) Forward to <egressBaseUrl><tool.path>?<query>.
+    let outbound_path = build_outbound_path(&tool_entry.path_template, &path_params, &query);
+    let header_refs: Vec<(&str, &str)> = forward_headers
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
-    let body_slice: &[u8] = &body_bytes;
-
-    let service = match services.get(tool_entry.upstream_index) {
-        Some(s) => s,
-        None => {
-            logger::error!(
-                "utcp-manual-validator: tool '{}' references upstream {} but no Service registered",
-                tool_name,
-                tool_entry.upstream_index
-            );
-            return Flow::Break(
-                Response::new(500)
-                    .with_headers(vec![("content-type".into(), "application/json".into())])
-                    .with_body(audit::render_error_body("utcp.upstream_misconfigured")),
-            );
-        }
-    };
-
     logger::info!(
-        "utcp-manual-validator: dispatching tool='{}' -> {} {}{} principal={:?}",
+        "utcp-manual-validator: forwarding tool='{}' {} {} -> {}{} principal={:?}",
         tool_name,
-        tool_entry.method,
-        tool_entry.upstream_url,
+        method,
+        bare_path,
+        cfg.egress_service.uri().authority(),
         outbound_path,
         principal
     );
 
-    // 8) Issue outbound HTTP. We use `send(method)` so any HTTP method
-    //    string the operator configured (GET/POST/PUT/PATCH/DELETE/...)
-    //    flows through unchanged.
-    let response_result = client
-        .request(service)
+    let response = client
+        .request(&cfg.egress_service)
         .path(&outbound_path)
         .headers(header_refs)
-        .body(body_slice)
-        .timeout(Duration::from_secs(cfg.outbound_timeout_seconds as u64))
-        .send(&tool_entry.method)
+        .timeout(cfg.outbound_timeout)
+        .body(body_bytes.as_slice())
+        .send(&method)
         .await;
 
-    match response_result {
-        Ok(resp) => {
-            let status = resp.status_code();
-            let mut out_headers: Vec<(String, String)> = resp
+    match response {
+        Ok(upstream) => {
+            let status = upstream.status_code();
+            let resp_headers: Vec<(String, String)> = upstream
                 .headers()
                 .iter()
-                .filter(|(k, _)| {
-                    let lower = k.to_ascii_lowercase();
-                    !lower.starts_with(':')
-                        && !SKIP_HEADERS.iter().any(|h| *h == lower)
-                })
+                .filter(|(k, _)| !is_hop_by_hop(k) && !is_pseudo_header(k))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
-            // Preserve the matched tool tag on the way back.
-            out_headers.retain(|(k, _)| !k.eq_ignore_ascii_case(&cfg.tool_header_name));
-            out_headers.push((cfg.tool_header_name.clone(), tool_name.clone()));
-            let body = resp.body().to_vec();
-            Flow::Break(Response::new(status as u32).with_headers(out_headers).with_body(body))
+            let body = upstream.body().to_vec();
+            Flow::Break(
+                Response::new(status)
+                    .with_headers(resp_headers)
+                    .with_body(body),
+            )
         }
         Err(e) => {
             logger::warn!(
-                "utcp-manual-validator: upstream call failed for tool='{}': {e}",
-                tool_name
+                "utcp-manual-validator: upstream call failed tool='{}': {}",
+                tool_name,
+                e
             );
             Flow::Break(
-                Response::new(504)
+                Response::new(502)
                     .with_headers(vec![("content-type".into(), "application/json".into())])
-                    .with_body(audit::render_error_body("utcp.upstream_timeout")),
+                    .with_body(audit::render_error_body("utcp.upstream_unavailable")),
             )
         }
     }
@@ -371,46 +301,19 @@ fn strip_proxy_prefix<'a>(path: &'a str, prefix: &str) -> &'a str {
     }
 }
 
-/// Replace `{name}` placeholders in `template` with values from
-/// `params`. Unknown placeholders are left as-is so they're visible in
-/// upstream logs.
-fn resolve_path_template(template: &str, params: &std::collections::HashMap<String, String>) -> String {
-    if !template.contains('{') {
-        return template.to_string();
-    }
-    let mut out = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some(start) = rest.find('{') {
-        out.push_str(&rest[..start]);
-        if let Some(end) = rest[start..].find('}') {
-            let name = &rest[start + 1..start + end];
-            if let Some(v) = params.get(name) {
-                out.push_str(v);
-            } else {
-                out.push_str(&rest[start..start + end + 1]);
-            }
-            rest = &rest[start + end + 1..];
-        } else {
-            out.push_str(&rest[start..]);
-            return out;
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
 /// Build the `{ <param>: ..., body: <body> }` shape the inputs JSON
 /// Schema expects.
 fn build_synthetic_value(
-    resolved: &validate::ResolvedRoute<'_>,
+    path_params: &std::collections::HashMap<String, String>,
+    query: &std::collections::HashMap<String, Vec<String>>,
     body: Option<serde_json::Value>,
 ) -> serde_json::Value {
     let mut map = serde_json::Map::new();
 
-    for (k, v) in &resolved.path_params {
+    for (k, v) in path_params {
         map.insert(k.clone(), serde_json::Value::String(v.clone()));
     }
-    for (k, vs) in &resolved.query {
+    for (k, vs) in query {
         let value = if vs.len() == 1 {
             serde_json::Value::String(vs[0].clone())
         } else {
@@ -422,6 +325,100 @@ fn build_synthetic_value(
         map.insert("body".into(), b);
     }
     serde_json::Value::Object(map)
+}
+
+/// Substitute `{name}` segments in `tool.path_template` with the
+/// resolved values, then re-attach the query string from the inbound
+/// request.
+fn build_outbound_path(
+    template: &str,
+    path_params: &std::collections::HashMap<String, String>,
+    query: &std::collections::HashMap<String, Vec<String>>,
+) -> String {
+    let mut out = String::with_capacity(template.len());
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if let Some(end) = template[i..].find('}') {
+                let key = &template[i + 1..i + end];
+                if let Some(v) = path_params.get(key) {
+                    out.push_str(&urlencode_path_segment(v));
+                } else {
+                    out.push_str(&template[i..i + end + 1]);
+                }
+                i += end + 1;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    if !query.is_empty() {
+        let mut first = true;
+        for (k, vs) in query {
+            for v in vs {
+                out.push(if first { '?' } else { '&' });
+                first = false;
+                out.push_str(&urlencode_query(k));
+                out.push('=');
+                out.push_str(&urlencode_query(v));
+            }
+        }
+    }
+    out
+}
+
+fn urlencode_path_segment(s: &str) -> String {
+    use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+    utf8_percent_encode(s, NON_ALPHANUMERIC).to_string()
+}
+
+fn urlencode_query(s: &str) -> String {
+    use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+    utf8_percent_encode(s, NON_ALPHANUMERIC).to_string()
+}
+
+/// Collect inbound headers that should travel upstream. Drops
+/// hop-by-hop headers (RFC 7230) and HTTP/2 pseudo-headers (`:path`,
+/// `:authority`, ...) since those are populated by the request
+/// builder. Adds the `<toolHeaderName>: <tool_name>` audit tag.
+fn collect_forward_headers(
+    request: &RequestHeadersState,
+    tool_header_name: &str,
+    tool_name: &str,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (k, v) in request.handler().headers() {
+        if is_hop_by_hop(&k) || is_pseudo_header(&k) {
+            continue;
+        }
+        if k.eq_ignore_ascii_case(tool_header_name) {
+            continue;
+        }
+        out.push((k, v));
+    }
+    out.push((tool_header_name.to_string(), tool_name.to_string()));
+    out
+}
+
+fn is_hop_by_hop(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "host"
+    )
+}
+
+fn is_pseudo_header(name: &str) -> bool {
+    name.starts_with(':')
 }
 
 #[cfg(test)]
@@ -439,29 +436,43 @@ mod tests {
     }
 
     #[test]
-    fn resolve_path_template_substitutes() {
-        let mut p = HashMap::new();
-        p.insert("id".to_string(), "42".to_string());
-        assert_eq!(resolve_path_template("/users/{id}", &p), "/users/42");
-        assert_eq!(resolve_path_template("/users", &p), "/users");
-        assert_eq!(
-            resolve_path_template("/users/{missing}/bar", &p),
-            "/users/{missing}/bar"
-        );
-    }
-
-    #[test]
     fn synthetic_value_has_path_and_body() {
         let mut path_params = HashMap::new();
         path_params.insert("id".into(), "42".into());
-        let resolved = validate::ResolvedRoute {
-            tool_index: 0,
-            tool_name: "x",
-            path_params,
-            query: HashMap::new(),
-        };
-        let synth = build_synthetic_value(&resolved, Some(serde_json::json!({"k":"v"})));
+        let synth = build_synthetic_value(
+            &path_params,
+            &HashMap::new(),
+            Some(serde_json::json!({"k":"v"})),
+        );
         assert_eq!(synth.get("id").and_then(|v| v.as_str()), Some("42"));
         assert!(synth.get("body").is_some());
+    }
+
+    #[test]
+    fn outbound_path_substitutes_params_and_query() {
+        let mut path_params = HashMap::new();
+        path_params.insert("id".into(), "42".into());
+        let mut query = HashMap::new();
+        query.insert("q".into(), vec!["hello world".into()]);
+        let p = build_outbound_path("/items/{id}", &path_params, &query);
+        // exact query order is map-dependent, but must contain the encoded value
+        assert!(p.starts_with("/items/42?"));
+        assert!(p.contains("q=hello%20world"));
+    }
+
+    #[test]
+    fn outbound_path_no_params_no_query() {
+        let p = build_outbound_path("/api/order", &HashMap::new(), &HashMap::new());
+        assert_eq!(p, "/api/order");
+    }
+
+    #[test]
+    fn hop_by_hop_filter_drops_connection_and_host() {
+        assert!(is_hop_by_hop("Connection"));
+        assert!(is_hop_by_hop("host"));
+        assert!(is_hop_by_hop("Transfer-Encoding"));
+        assert!(!is_hop_by_hop("content-type"));
+        assert!(is_pseudo_header(":path"));
+        assert!(!is_pseudo_header("path"));
     }
 }
